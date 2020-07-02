@@ -45,6 +45,7 @@ fn balance_matrices<F: Field>(
     a_matrix: &mut Matrix<F>,
     b_matrix: &mut Matrix<F>,
     c_matrix: &mut Matrix<F>,
+    balance_target: usize,
 ) {
     // Step 1: define the heap entry data type
     #[cfg_attr(rustfmt, rustfmt_skip)]
@@ -117,11 +118,20 @@ fn balance_matrices<F: Field>(
     // Step 5: start the loop for reducing the densest matrix; by default, swappable is used
     let mut do_swappable_if_possible = true;
     loop {
-        // Step 5.1: find the densest matrix
+        // Step 5.1: if the density is close to the target, stop
+        if balance_target != 0
+            && current_overall_density
+                - min(min(current_a_density, current_b_density), current_c_density)
+                <= balance_target
+        {
+            break;
+        }
+
+        // Step 5.2: find the densest matrix
         let is_a_densest = current_a_density == current_overall_density;
         let is_b_densest = (!is_a_densest) && (current_b_density == current_overall_density);
 
-        // Step 5.2: get the densest LC in this densest matrix
+        // Step 5.3: get the densest LC in this densest matrix
         let mut densest_lc_index: usize;
         let mut densest_lc_count: usize;
         loop {
@@ -138,14 +148,14 @@ fn balance_matrices<F: Field>(
             }
         }
 
-        // Step 5.3: obtain the constraint that has this densest LC
+        // Step 5.4: obtain the constraint that has this densest LC
         let a = &a_matrix[densest_lc_index];
         let b = &b_matrix[densest_lc_index];
         let c = &c_matrix[densest_lc_index];
         #[cfg_attr(rustfmt, rustfmt_skip)]
         let cur = if is_a_densest { a } else if is_b_densest { b } else { c };
 
-        // Step 5.4: initialize the data structures for storing the suggestion.
+        // Step 5.5: initialize the data structures for storing the suggestion.
         let mut suggested_constraints =
             Vec::<(Vec<(F, usize)>, Vec<(F, usize)>, Vec<(F, usize)>)>::new();
         let mut suggested_new_variables = Vec::<Vec<(F, usize)>>::new();
@@ -162,7 +172,7 @@ fn balance_matrices<F: Field>(
             };
         }
 
-        // Step 5.5: Discuss case by case
+        // Step 5.6: Discuss case by case
         if is_a_densest || is_b_densest {
             // Case 1: a or b is the densest
             //   There are two possible strategies:
@@ -337,7 +347,7 @@ fn balance_matrices<F: Field>(
             }
         }
 
-        // Step 5.6: compute the new density if the suggested changes are accepted
+        // Step 5.7: compute the new density if the suggested changes are accepted
         let new_a_density = current_a_density - a.len()
             + suggested_constraints
                 .iter()
@@ -355,7 +365,7 @@ fn balance_matrices<F: Field>(
                 .sum::<usize>();
         let new_overall_density = max(max(new_a_density, new_b_density), new_c_density);
 
-        // Step 5.7: compute if there is improvement
+        // Step 5.8: compute if there is improvement
         #[cfg_attr(rustfmt, rustfmt_skip)]
         let current_penalty =
             ((current_a_density * current_a_density + current_b_density * current_b_density + current_c_density * current_c_density) as f64).sqrt();
@@ -363,18 +373,18 @@ fn balance_matrices<F: Field>(
         let new_penalty =
             ((new_a_density * new_a_density + new_b_density * new_b_density + new_c_density * new_c_density) as f64).sqrt();
 
-        // Step 5.8: if there is no improvement and swapping has been used, stop swapping
+        // Step 5.9: if there is no improvement and swapping has been used, stop swapping
         if new_penalty >= current_penalty && do_swappable_if_possible {
             do_swappable_if_possible = false;
             continue;
         }
 
-        // Step 5.9: stop when there is no improvement
+        // Step 5.10: stop when there is no improvement
         if do_swappable_if_possible == false && new_penalty >= current_penalty {
             break;
         }
 
-        // Step 5.10: now, we are going to take the suggestion
+        // Step 5.11: now, we are going to take the suggestion
 
         // delete the constraint
         deleted_constraints[densest_lc_index] = true;
@@ -478,6 +488,7 @@ impl<F: Field> IndexerConstraintSystem<F> {
             &mut a,
             &mut b,
             &mut c,
+            ((a_density + b_density + c_density) as f64 / 3.0 * 0.1) as usize,
         );
 
         let a_density: usize = a.iter().map(|row| row.len()).sum();
