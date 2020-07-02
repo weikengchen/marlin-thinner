@@ -58,31 +58,54 @@ fn balance_matrices<F: Field>(
 
     let mut deleted_constraints = vec![false; a_matrix.len()];
 
-    struct IndexedEntrySize(usize, bool, usize, usize); // index, is_AB, its value, other's value if AB.
+    struct IndexedEntrySize {
+        index: usize,
+        is_AB: bool,
+        value: usize,
+        other_value_if_AB: usize,
+    };
+
+    impl IndexedEntrySize {
+        fn new(index: usize, is_AB: bool, value: usize, other_value_if_AB: usize) -> Self {
+            Self {
+                index,
+                is_AB,
+                value,
+                other_value_if_AB,
+            }
+        }
+    }
+
     impl PartialOrd for IndexedEntrySize {
         fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-            if self.1 == true {
-                Some(self.2.cmp(&other.2).then(other.3.cmp(&self.3))) // prefer the one with the biggest gap between A/B
+            if self.is_AB == true {
+                Some(
+                    self.value
+                        .cmp(&other.value)
+                        .then(other.other_value_if_AB.cmp(&self.other_value_if_AB)),
+                ) // prefer the one with the biggest gap between A/B
             } else {
-                Some(self.2.cmp(&other.2))
+                Some(self.value.cmp(&other.value))
             }
         }
     }
     impl PartialEq for IndexedEntrySize {
         fn eq(&self, other: &Self) -> bool {
-            if self.1 == true {
-                self.2.eq(&other.2) && self.3.eq(&other.3)
+            if self.is_AB == true {
+                self.value.eq(&other.value) && self.other_value_if_AB.eq(&other.other_value_if_AB)
             } else {
-                self.2.eq(&other.2)
+                self.value.eq(&other.value)
             }
         }
     }
     impl Ord for IndexedEntrySize {
         fn cmp(&self, other: &Self) -> Ordering {
-            if self.1 == true {
-                self.2.cmp(&other.2).then(other.3.cmp(&self.3)) // prefer the one with the biggest gap between A/B
+            if self.is_AB == true {
+                self.value
+                    .cmp(&other.value)
+                    .then(other.other_value_if_AB.cmp(&self.other_value_if_AB)) // prefer the one with the biggest gap between A/B
             } else {
-                self.2.cmp(&other.2)
+                self.value.cmp(&other.value)
             }
         }
     }
@@ -98,9 +121,9 @@ fn balance_matrices<F: Field>(
             .zip(c_matrix.iter())
             .enumerate()
         {
-            indexed_a_matrix.push(IndexedEntrySize(i, true, a.len(), b.len()));
-            indexed_b_matrix.push(IndexedEntrySize(i, true, b.len(), a.len()));
-            indexed_c_matrix.push(IndexedEntrySize(i, true, c.len(), 0));
+            indexed_a_matrix.push(IndexedEntrySize::new(i, true, a.len(), b.len()));
+            indexed_b_matrix.push(IndexedEntrySize::new(i, true, b.len(), a.len()));
+            indexed_c_matrix.push(IndexedEntrySize::new(i, true, c.len(), 0));
         }
         (
             BinaryHeap::from(indexed_a_matrix),
@@ -140,8 +163,8 @@ fn balance_matrices<F: Field>(
             }
             .unwrap();
 
-            lc_index = res.0;
-            lc_count = res.2;
+            lc_index = res.index;
+            lc_count = res.value;
 
             if deleted_constraints[lc_index] == false {
                 break '_inner;
@@ -152,7 +175,7 @@ fn balance_matrices<F: Field>(
             break '_outer;
         }
 
-        // virtually remove this constraint from the three heap
+        // virtually remove this constraint from the three heaps
         deleted_constraints[lc_index] = true;
 
         // discuss by cases
@@ -180,9 +203,9 @@ fn balance_matrices<F: Field>(
                 let index = a_matrix.len();
 
                 // update the heap
-                a_heap.push(IndexedEntrySize(index, true, new_a.len(), new_b.len()));
-                b_heap.push(IndexedEntrySize(index, true, new_b.len(), new_a.len()));
-                c_heap.push(IndexedEntrySize(index, false, new_c.len(), 0));
+                a_heap.push(IndexedEntrySize::new(index, true, new_a.len(), new_b.len()));
+                b_heap.push(IndexedEntrySize::new(index, true, new_b.len(), new_a.len()));
+                c_heap.push(IndexedEntrySize::new(index, false, new_c.len(), 0));
 
                 // add a new constraint
                 a_matrix.push(new_a);
@@ -285,23 +308,33 @@ fn balance_matrices<F: Field>(
                     let index = a_matrix.len();
 
                     // update the heap
-                    a_heap.push(IndexedEntrySize(index, true, new_1_a.len(), new_1_b.len()));
-                    b_heap.push(IndexedEntrySize(index, true, new_1_b.len(), new_1_a.len()));
-                    c_heap.push(IndexedEntrySize(index, false, new_1_c.len(), 0));
+                    a_heap.push(IndexedEntrySize::new(
+                        index,
+                        true,
+                        new_1_a.len(),
+                        new_1_b.len(),
+                    ));
+                    b_heap.push(IndexedEntrySize::new(
+                        index,
+                        true,
+                        new_1_b.len(),
+                        new_1_a.len(),
+                    ));
+                    c_heap.push(IndexedEntrySize::new(index, false, new_1_c.len(), 0));
 
-                    a_heap.push(IndexedEntrySize(
+                    a_heap.push(IndexedEntrySize::new(
                         index + 1,
                         true,
                         new_2_a.len(),
                         new_2_b.len(),
                     ));
-                    b_heap.push(IndexedEntrySize(
+                    b_heap.push(IndexedEntrySize::new(
                         index + 1,
                         true,
                         new_2_b.len(),
                         new_2_a.len(),
                     ));
-                    c_heap.push(IndexedEntrySize(index + 1, false, new_2_c.len(), 0));
+                    c_heap.push(IndexedEntrySize::new(index + 1, false, new_2_c.len(), 0));
 
                     if is_a_densest {
                         additional_balancing_constraints.push(a.clone());
@@ -456,37 +489,47 @@ fn balance_matrices<F: Field>(
                     let index = a_matrix.len();
 
                     // update the heap
-                    a_heap.push(IndexedEntrySize(index, true, new_1_a.len(), new_1_b.len()));
-                    b_heap.push(IndexedEntrySize(index, true, new_1_b.len(), new_1_a.len()));
-                    c_heap.push(IndexedEntrySize(index, false, new_1_c.len(), 0));
+                    a_heap.push(IndexedEntrySize::new(
+                        index,
+                        true,
+                        new_1_a.len(),
+                        new_1_b.len(),
+                    ));
+                    b_heap.push(IndexedEntrySize::new(
+                        index,
+                        true,
+                        new_1_b.len(),
+                        new_1_a.len(),
+                    ));
+                    c_heap.push(IndexedEntrySize::new(index, false, new_1_c.len(), 0));
 
-                    a_heap.push(IndexedEntrySize(
+                    a_heap.push(IndexedEntrySize::new(
                         index + 1,
                         true,
                         new_2_a.len(),
                         new_2_b.len(),
                     ));
-                    b_heap.push(IndexedEntrySize(
+                    b_heap.push(IndexedEntrySize::new(
                         index + 1,
                         true,
                         new_2_b.len(),
                         new_2_a.len(),
                     ));
-                    c_heap.push(IndexedEntrySize(index + 1, false, new_2_c.len(), 0));
+                    c_heap.push(IndexedEntrySize::new(index + 1, false, new_2_c.len(), 0));
 
-                    a_heap.push(IndexedEntrySize(
+                    a_heap.push(IndexedEntrySize::new(
                         index + 2,
                         true,
                         new_3_a.len(),
                         new_3_b.len(),
                     ));
-                    b_heap.push(IndexedEntrySize(
+                    b_heap.push(IndexedEntrySize::new(
                         index + 2,
                         true,
                         new_3_b.len(),
                         new_3_a.len(),
                     ));
-                    c_heap.push(IndexedEntrySize(index + 1, false, new_3_c.len(), 0));
+                    c_heap.push(IndexedEntrySize::new(index + 1, false, new_3_c.len(), 0));
 
                     additional_balancing_constraints.push(u.clone());
                     additional_balancing_constraints.push(v.clone());
@@ -552,23 +595,33 @@ fn balance_matrices<F: Field>(
                 let index = a_matrix.len();
 
                 // update the heap
-                a_heap.push(IndexedEntrySize(index, true, new_1_a.len(), new_1_b.len()));
-                b_heap.push(IndexedEntrySize(index, true, new_1_b.len(), new_1_a.len()));
-                c_heap.push(IndexedEntrySize(index, false, new_1_c.len(), 0));
+                a_heap.push(IndexedEntrySize::new(
+                    index,
+                    true,
+                    new_1_a.len(),
+                    new_1_b.len(),
+                ));
+                b_heap.push(IndexedEntrySize::new(
+                    index,
+                    true,
+                    new_1_b.len(),
+                    new_1_a.len(),
+                ));
+                c_heap.push(IndexedEntrySize::new(index, false, new_1_c.len(), 0));
 
-                a_heap.push(IndexedEntrySize(
+                a_heap.push(IndexedEntrySize::new(
                     index + 1,
                     true,
                     new_2_a.len(),
                     new_2_b.len(),
                 ));
-                b_heap.push(IndexedEntrySize(
+                b_heap.push(IndexedEntrySize::new(
                     index + 1,
                     true,
                     new_2_b.len(),
                     new_2_a.len(),
                 ));
-                c_heap.push(IndexedEntrySize(index + 1, false, new_2_c.len(), 0));
+                c_heap.push(IndexedEntrySize::new(index + 1, false, new_2_c.len(), 0));
 
                 additional_balancing_constraints.push(c.clone());
 
@@ -655,37 +708,47 @@ fn balance_matrices<F: Field>(
                 let index = a_matrix.len();
 
                 // update the heap
-                a_heap.push(IndexedEntrySize(index, true, new_1_a.len(), new_1_b.len()));
-                b_heap.push(IndexedEntrySize(index, true, new_1_b.len(), new_1_a.len()));
-                c_heap.push(IndexedEntrySize(index, false, new_1_c.len(), 0));
+                a_heap.push(IndexedEntrySize::new(
+                    index,
+                    true,
+                    new_1_a.len(),
+                    new_1_b.len(),
+                ));
+                b_heap.push(IndexedEntrySize::new(
+                    index,
+                    true,
+                    new_1_b.len(),
+                    new_1_a.len(),
+                ));
+                c_heap.push(IndexedEntrySize::new(index, false, new_1_c.len(), 0));
 
-                a_heap.push(IndexedEntrySize(
+                a_heap.push(IndexedEntrySize::new(
                     index + 1,
                     true,
                     new_2_a.len(),
                     new_2_b.len(),
                 ));
-                b_heap.push(IndexedEntrySize(
+                b_heap.push(IndexedEntrySize::new(
                     index + 1,
                     true,
                     new_2_b.len(),
                     new_2_a.len(),
                 ));
-                c_heap.push(IndexedEntrySize(index + 1, false, new_2_c.len(), 0));
+                c_heap.push(IndexedEntrySize::new(index + 1, false, new_2_c.len(), 0));
 
-                a_heap.push(IndexedEntrySize(
+                a_heap.push(IndexedEntrySize::new(
                     index + 2,
                     true,
                     new_3_a.len(),
                     new_3_b.len(),
                 ));
-                b_heap.push(IndexedEntrySize(
+                b_heap.push(IndexedEntrySize::new(
                     index + 2,
                     true,
                     new_3_b.len(),
                     new_3_a.len(),
                 ));
-                c_heap.push(IndexedEntrySize(index + 1, false, new_3_c.len(), 0));
+                c_heap.push(IndexedEntrySize::new(index + 1, false, new_3_c.len(), 0));
 
                 additional_balancing_constraints.push(u.clone());
                 additional_balancing_constraints.push(v.clone());
