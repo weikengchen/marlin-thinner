@@ -144,21 +144,40 @@ impl<F: PrimeField> AHPForR1CS<F> {
 
         let ProverConstraintSystem {
             input_assignment: formatted_input_assignment,
-            witness_assignment,
+            mut witness_assignment,
             num_constraints,
             ..
         } = pcs;
 
         let num_input_variables = formatted_input_assignment.len();
         let num_witness_variables = witness_assignment.len();
-        if index.index_info.num_constraints != num_constraints
-            || num_input_variables + num_witness_variables != index.index_info.num_variables
+        if index.index_info.num_constraints
+            != num_constraints + index.additional_balancing_constraints.len()
+            || num_input_variables
+                + num_witness_variables
+                + index.additional_balancing_constraints.len()
+                != index.index_info.num_variables
         {
             Err(Error::InstanceDoesNotMatchIndex)?;
         }
 
         if !Self::formatted_public_input_is_admissible(&formatted_input_assignment) {
             Err(Error::InvalidPublicInputLength)?
+        }
+
+        // Compute the witness values created by the balancing algorithms
+        for lc in index.additional_balancing_constraints.iter() {
+            let mut acc = F::zero();
+            for &(ref coeff, i) in lc {
+                let tmp = if i < num_input_variables {
+                    formatted_input_assignment[i]
+                } else {
+                    witness_assignment[i - num_input_variables]
+                };
+
+                acc += &(if coeff.is_one() { tmp } else { tmp * coeff });
+            }
+            witness_assignment.push(acc)
         }
 
         // Perform matrix multiplications
@@ -186,8 +205,10 @@ impl<F: PrimeField> AHPForR1CS<F> {
 
         let zk_bound = 1; // One query is sufficient for our desired soundness
 
-        let domain_h = GeneralEvaluationDomain::new(num_constraints)
-            .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
+        let domain_h = GeneralEvaluationDomain::new(
+            num_constraints + index.additional_balancing_constraints.len(),
+        )
+        .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
 
         let domain_k = GeneralEvaluationDomain::new(num_non_zero)
             .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;

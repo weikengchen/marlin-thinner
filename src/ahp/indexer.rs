@@ -65,6 +65,9 @@ pub struct Index<'a, F: PrimeField, C> {
     /// Information about the index.
     pub index_info: IndexInfo<F, C>,
 
+    /// Description of the additional witness variables
+    pub additional_balancing_constraints: Matrix<F>,
+
     /// The A matrix for the R1CS instance
     pub a: Matrix<F>,
     /// The B matrix for the R1CS instance
@@ -119,6 +122,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let padding_time = start_timer!(|| "Padding matrices to make them square");
         ics.make_matrices_square();
         end_timer!(padding_time);
+
         let matrix_processing_time = start_timer!(|| "Processing matrices");
         ics.process_matrices();
         end_timer!(matrix_processing_time);
@@ -162,6 +166,7 @@ impl<F: PrimeField> AHPForR1CS<F> {
         let b_domain = GeneralEvaluationDomain::<F>::new(3 * domain_k.size() - 3)
             .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
 
+        let additional_balancing_constraints = ics.additional_balancing_constraints.clone();
         let (mut a, mut b, mut c) = ics.constraint_matrices().expect("should not be `None`");
 
         let a_arithmetization_time = start_timer!(|| "Arithmetizing A");
@@ -179,6 +184,8 @@ impl<F: PrimeField> AHPForR1CS<F> {
         end_timer!(index_time);
         Ok(Index {
             index_info,
+
+            additional_balancing_constraints,
 
             a,
             b,

@@ -2,7 +2,7 @@
 
 use crate::ahp::indexer::Matrix;
 use crate::ahp::*;
-use crate::{BTreeMap, Cow, String, ToString};
+use crate::{BTreeMap, BinaryHeap, Cow, String, ToString};
 use algebra_core::{Field, PrimeField};
 use derivative::Derivative;
 use ff_fft::{
@@ -10,6 +10,7 @@ use ff_fft::{
 };
 use poly_commit::LabeledPolynomial;
 use r1cs_core::{ConstraintSystem, Index as VarIndex, LinearCombination, SynthesisError, Variable};
+use std::cmp::Ordering;
 
 /* ************************************************************************* */
 /* ************************************************************************* */
@@ -36,22 +37,707 @@ fn to_matrix_helper<F: Field>(
     new_matrix
 }
 
-fn balance_matrices<F: Field>(a_matrix: &mut Matrix<F>, b_matrix: &mut Matrix<F>) {
+fn balance_matrices<F: Field>(
+    num_input_variables: usize,
+    num_witness_variables: &mut usize,
+    num_constraints: &mut usize,
+    additional_balancing_constraints: &mut Matrix<F>,
+    a_matrix: &mut Matrix<F>,
+    b_matrix: &mut Matrix<F>,
+    c_matrix: &mut Matrix<F>,
+    balance_target: usize,
+) {
     let mut a_density: usize = a_matrix.iter().map(|row| row.len()).sum();
     let mut b_density: usize = b_matrix.iter().map(|row| row.len()).sum();
-    let mut max_density = core::cmp::max(a_density, b_density);
-    let mut a_is_denser = a_density == max_density;
-    for (a_row, b_row) in a_matrix.iter_mut().zip(b_matrix) {
-        if a_is_denser {
-            let a_row_size = a_row.len();
-            let b_row_size = b_row.len();
-            core::mem::swap(a_row, b_row);
-            a_density = a_density - a_row_size + b_row_size;
-            b_density = b_density - b_row_size + a_row_size;
-            max_density = core::cmp::max(a_density, b_density);
-            a_is_denser = a_density == max_density;
+    let mut c_density: usize = c_matrix.iter().map(|row| row.len()).sum();
+
+    let mut current_density = core::cmp::max(core::cmp::max(a_density, b_density), c_density);
+
+    let mut num_new_witness_variables = 0usize;
+    let witness_index_offset = num_input_variables + *num_witness_variables;
+
+    let mut deleted_constraints = vec![false; a_matrix.len()];
+
+    struct IndexedEntrySize(usize, bool, usize, usize); // index, is_AB, its value, other's value if AB.
+    impl PartialOrd for IndexedEntrySize {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            if self.1 == true {
+                Some(self.2.cmp(&other.2).then(other.3.cmp(&self.3))) // prefer the one with the biggest gap between A/B
+            } else {
+                Some(self.2.cmp(&other.2))
+            }
         }
     }
+    impl PartialEq for IndexedEntrySize {
+        fn eq(&self, other: &Self) -> bool {
+            if self.1 == true {
+                self.2.eq(&other.2) && self.3.eq(&other.3)
+            } else {
+                self.2.eq(&other.2)
+            }
+        }
+    }
+    impl Ord for IndexedEntrySize {
+        fn cmp(&self, other: &Self) -> Ordering {
+            if self.1 == true {
+                self.2.cmp(&other.2).then(other.3.cmp(&self.3)) // prefer the one with the biggest gap between A/B
+            } else {
+                self.2.cmp(&other.2)
+            }
+        }
+    }
+    impl Eq for IndexedEntrySize {}
+
+    let (mut a_heap, mut b_heap, mut c_heap) = {
+        let mut indexed_a_matrix = Vec::<IndexedEntrySize>::new();
+        let mut indexed_b_matrix = Vec::<IndexedEntrySize>::new();
+        let mut indexed_c_matrix = Vec::<IndexedEntrySize>::new();
+        for (i, ((a, b), c)) in a_matrix
+            .iter()
+            .zip(b_matrix.iter())
+            .zip(c_matrix.iter())
+            .enumerate()
+        {
+            indexed_a_matrix.push(IndexedEntrySize(i, true, a.len(), b.len()));
+            indexed_b_matrix.push(IndexedEntrySize(i, true, b.len(), a.len()));
+            indexed_c_matrix.push(IndexedEntrySize(i, true, c.len(), 0));
+        }
+        (
+            BinaryHeap::from(indexed_a_matrix),
+            BinaryHeap::from(indexed_b_matrix),
+            BinaryHeap::from(indexed_c_matrix),
+        )
+    };
+
+    let mut swappable = true;
+
+    '_outer: loop {
+        // do not continue if the gap is <= balance_target
+        if current_density - a_density <= balance_target
+            && current_density - b_density <= balance_target
+            && current_density - c_density <= balance_target
+        {
+            break '_outer;
+        }
+
+        // find the densest matrix; in case of same density, A first, B second, C third.
+        let is_a_densest = a_density == current_density;
+        let is_b_densest = (!is_a_densest) && (b_density == current_density);
+        let _is_c_densest = (!is_a_densest) && (!is_b_densest) && (c_density == current_density);
+
+        // get the densest, undeleted lc from the densest matrix.
+        let mut lc_index: usize;
+        let mut lc_count: usize;
+        '_inner: loop {
+            let res = {
+                if is_a_densest {
+                    a_heap.pop()
+                } else if is_b_densest {
+                    b_heap.pop()
+                } else {
+                    c_heap.pop()
+                }
+            }
+            .unwrap();
+
+            lc_index = res.0;
+            lc_count = res.2;
+
+            if deleted_constraints[lc_index] == false {
+                break '_inner;
+            }
+        }
+
+        if lc_count <= 4 {
+            break '_outer;
+        }
+
+        // virtually remove this constraint from the three heap
+        deleted_constraints[lc_index] = true;
+
+        // discuss by cases
+        let a = &a_matrix[lc_index];
+        let b = &b_matrix[lc_index];
+        let c = &c_matrix[lc_index];
+
+        if is_a_densest || is_b_densest {
+            if swappable
+                && ((is_a_densest && a.len() > b.len()) || (is_b_densest && b.len() > a.len()))
+            {
+                // if swapping can reduce the density, do so
+                // update the density count
+                a_density -= a.len();
+                a_density += b.len();
+
+                b_density -= b.len();
+                b_density += a.len();
+
+                let new_a = b.clone();
+                let new_b = a.clone();
+                let new_c = c.clone();
+
+                // get the new constraint's index
+                let index = a_matrix.len();
+
+                // update the heap
+                a_heap.push(IndexedEntrySize(index, true, new_a.len(), new_b.len()));
+                b_heap.push(IndexedEntrySize(index, true, new_b.len(), new_a.len()));
+                c_heap.push(IndexedEntrySize(index, false, new_c.len(), 0));
+
+                // add a new constraint
+                a_matrix.push(new_a);
+                b_matrix.push(new_b);
+                c_matrix.push(new_c);
+                deleted_constraints.push(false);
+            } else {
+                // swapping is not helpful, then it would be chopped to two parts
+                let the_other_ab_density = if is_a_densest { b_density } else { a_density };
+
+                let gap = core::cmp::max(the_other_ab_density, c_density)
+                    - core::cmp::min(the_other_ab_density, c_density);
+                if gap >= lc_count {
+                    let u_index = witness_index_offset + num_new_witness_variables;
+                    num_new_witness_variables += 1;
+
+                    let (new_1_a, new_1_b, new_1_c, new_2_a, new_2_b, new_2_c) =
+                        if the_other_ab_density < c_density {
+                            // put it into the other ab
+                            if is_a_densest {
+                                // in case of A, rewrite A * B = C to
+                                //      U * B = C where U is a single-variable LC
+                                //      1 * A = U
+                                (
+                                    vec![(F::one(), u_index)],
+                                    b.clone(),
+                                    c.clone(),
+                                    vec![(F::one(), 0)],
+                                    a.clone(),
+                                    vec![(F::one(), u_index)],
+                                )
+                            } else {
+                                // in case of B, rewrite A * B = C to
+                                //      A * U = C where U is a single-variable LC
+                                //      B * 1 = U
+                                (
+                                    a.clone(),
+                                    vec![(F::one(), u_index)],
+                                    c.clone(),
+                                    b.clone(),
+                                    vec![(F::one(), 0)],
+                                    vec![(F::one(), u_index)],
+                                )
+                            }
+                        } else {
+                            if is_a_densest {
+                                // in case of A, rewrite A * B = C to
+                                //      U * B = C where U is a single-variable LC
+                                //      U * 1 = A
+                                (
+                                    vec![(F::one(), u_index)],
+                                    b.clone(),
+                                    c.clone(),
+                                    vec![(F::one(), u_index)],
+                                    vec![(F::one(), 0)],
+                                    a.clone(),
+                                )
+                            } else {
+                                // in case of B, rewrite A * B = C to
+                                //      A * U = C where U is a single-variable LC
+                                //      1 * U = B
+                                (
+                                    a.clone(),
+                                    vec![(F::one(), u_index)],
+                                    c.clone(),
+                                    vec![(F::one(), 0)],
+                                    vec![(F::one(), u_index)],
+                                    b.clone(),
+                                )
+                            }
+                        };
+
+                    if the_other_ab_density < c_density {
+                        a_density = if is_a_densest {
+                            a_density - a.len() + 2
+                        } else {
+                            a_density + b.len()
+                        };
+                        b_density = if is_a_densest {
+                            b_density + a.len()
+                        } else {
+                            b_density - b.len() + 2
+                        };
+                        c_density += 1;
+                    } else {
+                        a_density = if is_a_densest {
+                            a_density - a.len() + 2
+                        } else {
+                            a_density + 1
+                        };
+                        b_density = if is_a_densest {
+                            b_density + 1
+                        } else {
+                            b_density - b.len() + 2
+                        };
+                        c_density += if is_a_densest { a.len() } else { b.len() };
+                    }
+
+                    // get the new constraint's index
+                    let index = a_matrix.len();
+
+                    // update the heap
+                    a_heap.push(IndexedEntrySize(index, true, new_1_a.len(), new_1_b.len()));
+                    b_heap.push(IndexedEntrySize(index, true, new_1_b.len(), new_1_a.len()));
+                    c_heap.push(IndexedEntrySize(index, false, new_1_c.len(), 0));
+
+                    a_heap.push(IndexedEntrySize(
+                        index + 1,
+                        true,
+                        new_2_a.len(),
+                        new_2_b.len(),
+                    ));
+                    b_heap.push(IndexedEntrySize(
+                        index + 1,
+                        true,
+                        new_2_b.len(),
+                        new_2_a.len(),
+                    ));
+                    c_heap.push(IndexedEntrySize(index + 1, false, new_2_c.len(), 0));
+
+                    if is_a_densest {
+                        additional_balancing_constraints.push(a.clone());
+                    } else {
+                        additional_balancing_constraints.push(b.clone());
+                    }
+
+                    // add the two new constraints
+                    a_matrix.push(new_1_a);
+                    b_matrix.push(new_1_b);
+                    c_matrix.push(new_1_c);
+                    deleted_constraints.push(false);
+
+                    a_matrix.push(new_2_a);
+                    b_matrix.push(new_2_b);
+                    c_matrix.push(new_2_c);
+                    deleted_constraints.push(false);
+                } else {
+                    // the gap is not that large, so the two other variables will always get density
+                    let u_index = witness_index_offset + num_new_witness_variables;
+                    num_new_witness_variables += 1;
+
+                    let v_index = witness_index_offset + num_new_witness_variables;
+                    num_new_witness_variables += 1;
+
+                    let u_density = (lc_count - gap) / 2; // the lighter
+                    let v_density = lc_count - u_density; // the denser
+
+                    let u = if is_a_densest {
+                        a[..u_density].to_vec()
+                    } else {
+                        b[..u_density].to_vec()
+                    };
+                    let v = if is_a_densest {
+                        a[u_density..].to_vec()
+                    } else {
+                        b[u_density..].to_vec()
+                    };
+
+                    let (
+                        new_1_a,
+                        new_1_b,
+                        new_1_c,
+                        new_2_a,
+                        new_2_b,
+                        new_2_c,
+                        new_3_a,
+                        new_3_b,
+                        new_3_c,
+                    ) = if the_other_ab_density < c_density {
+                        // put the lighter u for c, put v for the other
+                        if is_a_densest {
+                            // in case of A, rewrite A * B = C to
+                            //      (U + V) * B = C where U, V is a single-variable LC
+                            //      1 * U = A_1
+                            //      1 * A_2 = V
+                            (
+                                vec![(F::one(), u_index), (F::one(), v_index)],
+                                b.clone(),
+                                c.clone(),
+                                vec![(F::one(), 0)],
+                                vec![(F::one(), u_index)],
+                                u.clone(),
+                                vec![(F::one(), 0)],
+                                v.clone(),
+                                vec![(F::one(), v_index)],
+                            )
+                        } else {
+                            // in case of B, rewrite A * B = C to
+                            //      A * (U + V) = C where U, V is a single-variable LC
+                            //      1 * U = B_1
+                            //      B_2 * 1 = V
+                            (
+                                a.clone(),
+                                vec![(F::one(), u_index), (F::one(), v_index)],
+                                c.clone(),
+                                vec![(F::one(), 0)],
+                                vec![(F::one(), u_index)],
+                                u.clone(),
+                                v.clone(),
+                                vec![(F::one(), 0)],
+                                vec![(F::one(), v_index)],
+                            )
+                        }
+                    } else {
+                        // put the heavier v for c, put u for the other
+                        if is_a_densest {
+                            // in case of A, rewrite A * B = C to
+                            //      (U + V) * B = C where U, V is a single-variable LC
+                            //      1 * V = A_1
+                            //      1 * A_2 = U
+                            (
+                                vec![(F::one(), u_index), (F::one(), v_index)],
+                                b.clone(),
+                                c.clone(),
+                                vec![(F::one(), 0)],
+                                vec![(F::one(), v_index)],
+                                v.clone(),
+                                vec![(F::one(), 0)],
+                                u.clone(),
+                                vec![(F::one(), u_index)],
+                            )
+                        } else {
+                            // in case of B, rewrite A * B = C to
+                            //      A * (U + V) = C where U, V is a single-variable LC
+                            //      1 * V = B_1
+                            //      B_2 * 1 = U
+                            (
+                                a.clone(),
+                                vec![(F::one(), u_index), (F::one(), v_index)],
+                                c.clone(),
+                                vec![(F::one(), 0)],
+                                vec![(F::one(), v_index)],
+                                v.clone(),
+                                u.clone(),
+                                vec![(F::one(), 0)],
+                                vec![(F::one(), u_index)],
+                            )
+                        }
+                    };
+
+                    if the_other_ab_density < c_density {
+                        a_density = if is_a_densest {
+                            a_density - a.len() + 4
+                        } else {
+                            a_density + 1 + v_density
+                        };
+
+                        b_density = if is_a_densest {
+                            b_density + 1 + v_density
+                        } else {
+                            b_density - b.len() + 4
+                        };
+
+                        c_density += 1 + u_density;
+                    } else {
+                        a_density = if is_a_densest {
+                            a_density - a.len() + 4
+                        } else {
+                            a_density + 1 + u_density
+                        };
+                        b_density = if is_a_densest {
+                            b_density + 1 + u_density
+                        } else {
+                            b_density - b.len() + 4
+                        };
+
+                        c_density += 1 + v_density;
+                    }
+
+                    // get the new constraint's index
+                    let index = a_matrix.len();
+
+                    // update the heap
+                    a_heap.push(IndexedEntrySize(index, true, new_1_a.len(), new_1_b.len()));
+                    b_heap.push(IndexedEntrySize(index, true, new_1_b.len(), new_1_a.len()));
+                    c_heap.push(IndexedEntrySize(index, false, new_1_c.len(), 0));
+
+                    a_heap.push(IndexedEntrySize(
+                        index + 1,
+                        true,
+                        new_2_a.len(),
+                        new_2_b.len(),
+                    ));
+                    b_heap.push(IndexedEntrySize(
+                        index + 1,
+                        true,
+                        new_2_b.len(),
+                        new_2_a.len(),
+                    ));
+                    c_heap.push(IndexedEntrySize(index + 1, false, new_2_c.len(), 0));
+
+                    a_heap.push(IndexedEntrySize(
+                        index + 2,
+                        true,
+                        new_3_a.len(),
+                        new_3_b.len(),
+                    ));
+                    b_heap.push(IndexedEntrySize(
+                        index + 2,
+                        true,
+                        new_3_b.len(),
+                        new_3_a.len(),
+                    ));
+                    c_heap.push(IndexedEntrySize(index + 1, false, new_3_c.len(), 0));
+
+                    additional_balancing_constraints.push(u.clone());
+                    additional_balancing_constraints.push(v.clone());
+
+                    // add the three new constraints
+                    a_matrix.push(new_1_a);
+                    b_matrix.push(new_1_b);
+                    c_matrix.push(new_1_c);
+                    deleted_constraints.push(false);
+
+                    a_matrix.push(new_2_a);
+                    b_matrix.push(new_2_b);
+                    c_matrix.push(new_2_c);
+                    deleted_constraints.push(false);
+
+                    a_matrix.push(new_3_a);
+                    b_matrix.push(new_3_b);
+                    c_matrix.push(new_3_c);
+                    deleted_constraints.push(false);
+                }
+            }
+        } else {
+            // c is the densest
+            let gap = core::cmp::max(a_density, b_density) - core::cmp::min(a_density, c_density);
+            if gap >= lc_count {
+                let u_index = witness_index_offset + num_new_witness_variables;
+                num_new_witness_variables += 1;
+
+                let (new_1_a, new_1_b, new_1_c, new_2_a, new_2_b, new_2_c) = if a_density < b.len()
+                {
+                    // in case A has more space, rewrite A * B = C to
+                    //      A * B = U where U is a single-variable LC
+                    //      C * 1 = U
+                    (
+                        a.clone(),
+                        b.clone(),
+                        vec![(F::one(), u_index)],
+                        c.clone(),
+                        vec![(F::one(), 0)],
+                        vec![(F::one(), u_index)],
+                    )
+                } else {
+                    // in case A has more space, rewrite A * B = C to
+                    //      A * B = U where U is a single-variable LC
+                    //      1 * C = U
+                    (
+                        a.clone(),
+                        b.clone(),
+                        vec![(F::one(), u_index)],
+                        vec![(F::one(), 0)],
+                        c.clone(),
+                        vec![(F::one(), u_index)],
+                    )
+                };
+
+                a_density += if a_density < b.len() { c.len() } else { 1 };
+                b_density += if a_density < b.len() { 1 } else { c.len() };
+
+                c_density -= c.len();
+                c_density += 2;
+
+                // get the new constraint's index
+                let index = a_matrix.len();
+
+                // update the heap
+                a_heap.push(IndexedEntrySize(index, true, new_1_a.len(), new_1_b.len()));
+                b_heap.push(IndexedEntrySize(index, true, new_1_b.len(), new_1_a.len()));
+                c_heap.push(IndexedEntrySize(index, false, new_1_c.len(), 0));
+
+                a_heap.push(IndexedEntrySize(
+                    index + 1,
+                    true,
+                    new_2_a.len(),
+                    new_2_b.len(),
+                ));
+                b_heap.push(IndexedEntrySize(
+                    index + 1,
+                    true,
+                    new_2_b.len(),
+                    new_2_a.len(),
+                ));
+                c_heap.push(IndexedEntrySize(index + 1, false, new_2_c.len(), 0));
+
+                additional_balancing_constraints.push(c.clone());
+
+                // add the two new constraints
+                a_matrix.push(new_1_a);
+                b_matrix.push(new_1_b);
+                c_matrix.push(new_1_c);
+                deleted_constraints.push(false);
+
+                a_matrix.push(new_2_a);
+                b_matrix.push(new_2_b);
+                c_matrix.push(new_2_c);
+                deleted_constraints.push(false);
+            } else {
+                // the gap is not that large, so the two other variables will always get density
+                let u_index = witness_index_offset + num_new_witness_variables;
+                num_new_witness_variables += 1;
+
+                let v_index = witness_index_offset + num_new_witness_variables;
+                num_new_witness_variables += 1;
+
+                let u_density = (lc_count - gap) / 2; // the lighter
+                let v_density = lc_count - u_density; // the denser
+
+                let u = c[..u_density].to_vec();
+                let v = c[u_density..].to_vec();
+
+                let (
+                    new_1_a,
+                    new_1_b,
+                    new_1_c,
+                    new_2_a,
+                    new_2_b,
+                    new_2_c,
+                    new_3_a,
+                    new_3_b,
+                    new_3_c,
+                ) = if a_density < b_density {
+                    // in case A has more space, rewrite A * B = C to
+                    //      A * B = (U + V) where U, V is a single-variable LC
+                    //      1 * C_1 = U
+                    //      C_2 * 1 = V
+                    (
+                        a.clone(),
+                        b.clone(),
+                        vec![(F::one(), u_index), (F::one(), v_index)],
+                        vec![(F::one(), 0)],
+                        u.clone(),
+                        vec![(F::one(), u_index)],
+                        v.clone(),
+                        vec![(F::one(), 0)],
+                        vec![(F::one(), v_index)],
+                    )
+                } else {
+                    // in case B has more space, rewrite A * B = C to
+                    //      A * B = (U + V) where U, V is a single-variable LC
+                    //      1 * C_1 = V
+                    //      C_2 * 1 = U
+                    (
+                        a.clone(),
+                        b.clone(),
+                        vec![(F::one(), u_index), (F::one(), v_index)],
+                        vec![(F::one(), 0)],
+                        v.clone(),
+                        vec![(F::one(), v_index)],
+                        u.clone(),
+                        vec![(F::one(), 0)],
+                        vec![(F::one(), u_index)],
+                    )
+                };
+
+                if a_density < b_density {
+                    a_density += v_density + 1;
+                    b_density += u_density + 1;
+                } else {
+                    a_density += u_density + 1;
+                    b_density += v_density + 1;
+                }
+
+                c_density -= c.len();
+                c_density += 4;
+
+                // get the new constraint's index
+                let index = a_matrix.len();
+
+                // update the heap
+                a_heap.push(IndexedEntrySize(index, true, new_1_a.len(), new_1_b.len()));
+                b_heap.push(IndexedEntrySize(index, true, new_1_b.len(), new_1_a.len()));
+                c_heap.push(IndexedEntrySize(index, false, new_1_c.len(), 0));
+
+                a_heap.push(IndexedEntrySize(
+                    index + 1,
+                    true,
+                    new_2_a.len(),
+                    new_2_b.len(),
+                ));
+                b_heap.push(IndexedEntrySize(
+                    index + 1,
+                    true,
+                    new_2_b.len(),
+                    new_2_a.len(),
+                ));
+                c_heap.push(IndexedEntrySize(index + 1, false, new_2_c.len(), 0));
+
+                a_heap.push(IndexedEntrySize(
+                    index + 2,
+                    true,
+                    new_3_a.len(),
+                    new_3_b.len(),
+                ));
+                b_heap.push(IndexedEntrySize(
+                    index + 2,
+                    true,
+                    new_3_b.len(),
+                    new_3_a.len(),
+                ));
+                c_heap.push(IndexedEntrySize(index + 1, false, new_3_c.len(), 0));
+
+                additional_balancing_constraints.push(u.clone());
+                additional_balancing_constraints.push(v.clone());
+
+                // add the three new constraints
+                a_matrix.push(new_1_a);
+                b_matrix.push(new_1_b);
+                c_matrix.push(new_1_c);
+                deleted_constraints.push(false);
+
+                a_matrix.push(new_2_a);
+                b_matrix.push(new_2_b);
+                c_matrix.push(new_2_c);
+                deleted_constraints.push(false);
+
+                a_matrix.push(new_3_a);
+                b_matrix.push(new_3_b);
+                c_matrix.push(new_3_c);
+                deleted_constraints.push(false);
+            }
+        }
+
+        let new_overall_density = core::cmp::max(core::cmp::max(a_density, b_density), c_density);
+        if new_overall_density == current_density && swappable {
+            swappable = false;
+        }
+        if new_overall_density > current_density {
+            break '_outer;
+        }
+        current_density = new_overall_density;
+    }
+
+    *num_witness_variables += num_new_witness_variables;
+    *a_matrix = a_matrix
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| deleted_constraints[*i] == false)
+        .map(|(_, x)| x.clone())
+        .collect();
+    *b_matrix = b_matrix
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| deleted_constraints[*i] == false)
+        .map(|(_, x)| x.clone())
+        .collect();
+    *c_matrix = c_matrix
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| deleted_constraints[*i] == false)
+        .map(|(_, x)| x.clone())
+        .collect();
+    *num_constraints = a_matrix.len();
 }
 
 /// Stores constraints during index generation.
@@ -59,6 +745,8 @@ pub(crate) struct IndexerConstraintSystem<F: Field> {
     pub(crate) num_input_variables: usize,
     pub(crate) num_witness_variables: usize,
     pub(crate) num_constraints: usize,
+
+    pub(crate) additional_balancing_constraints: Matrix<F>,
     pub(crate) a: Vec<Vec<(F, VarIndex)>>,
     pub(crate) b: Vec<Vec<(F, VarIndex)>>,
     pub(crate) c: Vec<Vec<(F, VarIndex)>>,
@@ -72,8 +760,23 @@ impl<F: Field> IndexerConstraintSystem<F> {
     pub(crate) fn process_matrices(&mut self) {
         let mut a = to_matrix_helper(&self.a, self.num_input_variables);
         let mut b = to_matrix_helper(&self.b, self.num_input_variables);
-        let c = to_matrix_helper(&self.c, self.num_input_variables);
-        balance_matrices(&mut a, &mut b);
+        let mut c = to_matrix_helper(&self.c, self.num_input_variables);
+
+        let a_density: usize = a.iter().map(|row| row.len()).sum();
+        let b_density: usize = b.iter().map(|row| row.len()).sum();
+        let c_density: usize = c.iter().map(|row| row.len()).sum();
+
+        balance_matrices(
+            self.num_input_variables,
+            &mut self.num_witness_variables,
+            &mut self.num_constraints,
+            &mut self.additional_balancing_constraints,
+            &mut a,
+            &mut b,
+            &mut c,
+            ((a_density + b_density + c_density) as f64 / 3.0 * 0.1) as usize,
+        );
+
         self.a_matrix = Some(a);
         self.b_matrix = Some(b);
         self.c_matrix = Some(c);
@@ -92,6 +795,7 @@ impl<F: Field> IndexerConstraintSystem<F> {
             num_input_variables: 1,
             num_witness_variables: 0,
             num_constraints: 0,
+            additional_balancing_constraints: Vec::new(),
             a: Vec::new(),
             b: Vec::new(),
             c: Vec::new(),
@@ -110,9 +814,27 @@ impl<F: Field> IndexerConstraintSystem<F> {
     }
 
     pub(crate) fn num_non_zero(&self) -> usize {
-        let a_density = self.a.iter().map(|row| row.len()).sum();
-        let b_density = self.b.iter().map(|row| row.len()).sum();
-        let c_density = self.c.iter().map(|row| row.len()).sum();
+        let a_density = self
+            .a_matrix
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|row| row.len())
+            .sum();
+        let b_density = self
+            .b_matrix
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|row| row.len())
+            .sum();
+        let c_density = self
+            .c_matrix
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|row| row.len())
+            .sum();
 
         let max = *[a_density, b_density, c_density]
             .iter()
@@ -123,7 +845,6 @@ impl<F: Field> IndexerConstraintSystem<F> {
 
     pub(crate) fn make_matrices_square(&mut self) {
         let num_variables = self.num_input_variables + self.num_witness_variables;
-        let num_non_zero = self.num_non_zero();
         let matrix_dim = padded_matrix_dim(num_variables, self.num_constraints);
         make_matrices_square(self, num_variables);
         assert_eq!(
@@ -135,11 +856,6 @@ impl<F: Field> IndexerConstraintSystem<F> {
             self.num_input_variables + self.num_witness_variables,
             matrix_dim,
             "padding does not result in expected matrix size!"
-        );
-        assert_eq!(
-            self.num_non_zero(),
-            num_non_zero,
-            "padding changed matrix density"
         );
     }
 }
