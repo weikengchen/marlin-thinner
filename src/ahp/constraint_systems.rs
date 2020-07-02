@@ -293,7 +293,7 @@ fn balance_matrices<F: Field>(
                 - min(current_a_density, current_c_density);
             if diff >= densest_lc_count {
                 // relocate
-                if a.len() == 0 && b.len() == 0 {
+                if a.len() == 0 || b.len() == 0 {
                     // the case of 0 * 0 = LC
                     if current_a_density < current_b_density {
                         // rewrite 0 * 0 = C to
