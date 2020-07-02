@@ -293,23 +293,37 @@ fn balance_matrices<F: Field>(
                 - min(current_a_density, current_c_density);
             if diff >= densest_lc_count {
                 // relocate
-                add_new_witness_variable!(u_index, u, c);
-
-                if current_a_density < current_b_density {
-                    // rewrite A * B = C to
-                    //      C * 1 = U
-                    //      A * B = U
-                    #[cfg_attr(rustfmt, rustfmt_skip)]
-                    suggested_constraints.push((c.clone(), vec![(F::one(), 0)], vec![(F::one(), u_index)]));
+                if a.len() == 0 && b.len() == 0 {
+                    // the case of 0 * 0 = LC
+                    if current_a_density < current_b_density {
+                        // rewrite 0 * 0 = C to
+                        //      C * 1 = 0
+                        #[cfg_attr(rustfmt, rustfmt_skip)]
+                        suggested_constraints.push((c.clone(), vec![(F::one(), 0)], Vec::new()));
+                    } else {
+                        // rewrite 0 * 0 = C to
+                        //      1 * C = 0
+                        #[cfg_attr(rustfmt, rustfmt_skip)]
+                        suggested_constraints.push((vec![(F::one(), 0)], c.clone(), Vec::new()));
+                    }
                 } else {
-                    // rewrite A * B = C to
-                    //      1 * C = U
-                    //      A * B = U
+                    add_new_witness_variable!(u_index, u, c);
+                    if current_a_density < current_b_density {
+                        // rewrite A * B = C to
+                        //      C * 1 = U
+                        //      A * B = U
+                        #[cfg_attr(rustfmt, rustfmt_skip)]
+                            suggested_constraints.push((c.clone(), vec![(F::one(), 0)], vec![(F::one(), u_index)]));
+                    } else {
+                        // rewrite A * B = C to
+                        //      1 * C = U
+                        //      A * B = U
+                        #[cfg_attr(rustfmt, rustfmt_skip)]
+                            suggested_constraints.push((vec![(F::one(), 0)], c.clone(), vec![(F::one(), u_index)]));
+                    }
                     #[cfg_attr(rustfmt, rustfmt_skip)]
-                    suggested_constraints.push((vec![(F::one(), 0)], c.clone(), vec![(F::one(), u_index)]));
+                        suggested_constraints.push((a.clone(), b.clone(), vec![(F::one(), u_index)]));
                 }
-                #[cfg_attr(rustfmt, rustfmt_skip)]
-                suggested_constraints.push((a.clone(), b.clone(), vec![(F::one(), u_index)]));
             } else {
                 // split
                 add_new_witness_variable!(
@@ -475,10 +489,6 @@ impl<F: Field> IndexerConstraintSystem<F> {
         let a_density: usize = a.iter().map(|row| row.len()).sum();
         let b_density: usize = b.iter().map(|row| row.len()).sum();
         let c_density: usize = c.iter().map(|row| row.len()).sum();
-        eprintln!(
-            "before: {}, {}, {}, {}",
-            self.num_constraints, a_density, b_density, c_density
-        );
 
         balance_matrices(
             self.num_input_variables,
@@ -489,14 +499,6 @@ impl<F: Field> IndexerConstraintSystem<F> {
             &mut b,
             &mut c,
             ((a_density + b_density + c_density) as f64 / 3.0 * 0.1) as usize,
-        );
-
-        let a_density: usize = a.iter().map(|row| row.len()).sum();
-        let b_density: usize = b.iter().map(|row| row.len()).sum();
-        let c_density: usize = c.iter().map(|row| row.len()).sum();
-        eprintln!(
-            "after: {}, {}, {}, {}",
-            self.num_constraints, a_density, b_density, c_density
         );
 
         self.a_matrix = Some(a);
